@@ -132,8 +132,10 @@ disable=print-statement,
         invalid-name,
         global-statement,
         too-many-instance-attributes,
+        too-many-locals,
         logging-fstring-interpolation,
         unused-argument,
+        broad-except,
         fixme
 
 # Enable the message, report, category or checker with the given id(s). You can

@@ -2,14 +2,25 @@
 # Licensed under the MIT license
 
 import asyncio
+import logging
 import os
+import sys
 
 from unittest import TestCase
 
 import aiomultiprocess as amp
-from aiomultiprocess.core import context, PoolWorker
 
 from .base import async_test
+
+log = logging.getLogger()
+
+
+def init():
+    hdl = logging.StreamHandler(sys.stderr)
+    log = logging.getLogger()
+    log.addHandler(hdl)
+    # log.setLevel(logging.DEBUG)
+    # amp.core.log.setLevel(logging.DEBUG)
 
 
 async def two():
@@ -30,6 +41,10 @@ async def starmapper(*values):
 
 
 class CoreTest(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        init()
+
     def setUp(self):
         amp.set_context("spawn")
 
@@ -75,9 +90,9 @@ class CoreTest(TestCase):
 
     @async_test
     async def test_pool_worker(self):
-        tx = context.Queue()
-        rx = context.Queue()
-        worker = PoolWorker(tx, rx, 1)
+        tx = amp.core.context.Queue()
+        rx = amp.core.context.Queue()
+        worker = amp.core.PoolWorker(tx, rx, 1)
         worker.start()
 
         self.assertTrue(worker.is_alive())
@@ -107,26 +122,35 @@ class CoreTest(TestCase):
 
     @async_test
     async def test_spawn_context(self):
+        logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
+
+        log.debug("testing bad context")
         with self.assertRaises(ValueError):
             amp.set_context("foo")
 
         async def inline(x):
             return x
 
+        log.debug("testing good context")
         amp.set_context("spawn")
 
+        log.debug("testing spawn + inline function")
         with self.assertRaises(AttributeError):
-            p = amp.Worker(target=inline, args=(1,), name="test_inline")
+            p = amp.Worker(
+                target=inline, args=(1,), name="test_inline", initializer=init
+            )
             p.start()
             await p.join()
 
-        p = amp.Worker(target=two, name="test_global")
+        log.debug("testing spawn + global function")
+        p = amp.Worker(target=two, name="test_global", initializer=init)
         p.start()
         await p.join()
 
+        log.debug("testing spawn + pool.map")
         values = list(range(10))
         results = [await mapper(i) for i in values]
-        async with amp.Pool(2) as pool:
+        async with amp.Pool(2, initializer=init) as pool:
             self.assertEqual(await pool.map(mapper, values), results)
 
         self.assertEqual(p.result, 2)

@@ -38,6 +38,7 @@ context = multiprocessing.get_context()
 _manager = None
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
 
 MAX_TASKS_PER_CHILD = 0  # number of tasks to execute before recycling a child process
 CHILD_CONCURRENCY = 16  # number of tasks to execute simultaneously per child process
@@ -69,6 +70,7 @@ class Unit(NamedTuple):
     target: Callable
     args: Sequence[Any]
     kwargs: Dict[str, Any]
+    name: Optional[str]
     namespace: Any
     initializer: Optional[Callable] = None
     runner: Optional[Callable] = None
@@ -99,6 +101,7 @@ class Process:
             target=target or not_implemented,
             args=args or (),
             kwargs=kwargs or {},
+            name=name,
             namespace=get_manager().Namespace(),
             initializer=initializer,
         )
@@ -122,12 +125,15 @@ class Process:
         """Initialize the child process and event loop, then execute the coroutine."""
         try:
             if unit.initializer:
+                log.debug(f"running process initializer {unit.initializer}")
                 unit.initializer()
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
+            log.debug(f"running process target {unit.target}")
             result: R = loop.run_until_complete(unit.target(*unit.args, **unit.kwargs))
+            log.debug(f"process target returned {result}")
 
             return result
 
@@ -228,6 +234,8 @@ class Worker(Process):
 class PoolWorker(Process):
     """Individual worker process for the async pool."""
 
+    last_id = 0
+
     def __init__(
         self,
         tx: multiprocessing.Queue,
@@ -235,26 +243,40 @@ class PoolWorker(Process):
         ttl: int = MAX_TASKS_PER_CHILD,
         concurrency: int = CHILD_CONCURRENCY,
     ) -> None:
-        super().__init__(target=self.run)
-        self.concurrency = max(1, concurrency)
-        self.ttl = max(0, ttl)
-        self.tx = tx
-        self.rx = rx
+        wid, PoolWorker.last_id = PoolWorker.last_id, PoolWorker.last_id + 1
+        super().__init__(
+            name=f"PoolWorker-{wid}",
+            process_target=PoolWorker.run_async,
+            target=PoolWorker.run,
+            args=(tx, rx),
+        )
+        self.unit.namespace.concurrency = max(1, concurrency)
+        self.unit.namespace.ttl = max(0, ttl)
 
-    async def run(self) -> None:
+    @staticmethod
+    def run_async(unit: Unit) -> R:
+        unit = unit._replace(args=(unit, *unit.args))
+        return Process.run_async(unit)
+
+    @staticmethod
+    async def run(unit: Unit, tx, rx) -> None:
         """Pick up work, execute work, return results, rinse, repeat."""
         pending: Dict[asyncio.Future, TaskID] = {}
         completed = 0
         running = True
+
+        concurrency = unit.namespace.concurrency
+        ttl = unit.namespace.ttl
+
         while running or pending:
             # TTL, Tasks To Live, determines how many tasks to execute before dying
-            if self.ttl and completed >= self.ttl:
+            if ttl and completed >= ttl:
                 running = False
 
             # pick up new work as long as we're "running" and we have open slots
-            while running and len(pending) < self.concurrency:
+            while running and len(pending) < concurrency:
                 try:
-                    task: PoolTask = self.tx.get_nowait()
+                    task: PoolTask = tx.get_nowait()
                 except queue.Empty:
                     break
 
@@ -263,7 +285,7 @@ class PoolWorker(Process):
                     break
 
                 tid, func, args, kwargs = task
-                log.debug(f"{self.name} running {tid}: {func}(*{args}, **{kwargs})")
+                log.debug(f"{unit.name} running {tid}: {func}(*{args}, **{kwargs})")
                 future = asyncio.ensure_future(func(*args, **kwargs))
                 pending[future] = tid
 
@@ -283,8 +305,12 @@ class PoolWorker(Process):
                 except BaseException as e:
                     result = e
 
-                log.debug(f"{self.name} completed {tid}: {result}")
-                self.rx.put_nowait((tid, result))
+                log.debug(f"{unit.name} completed task #{tid}")
+                try:
+                    rx.put_nowait((tid, result))
+                except Exception as e:  # guard against unpickleable results
+                    log.exception("failed to queue result, queueing exception instead")
+                    rx.put_nowait((tid, str(e)))
                 completed += 1
 
 
@@ -325,34 +351,40 @@ class Pool:
 
     async def loop(self) -> None:
         """Maintain the pool of workers while open."""
+        log.debug("starting pool run loop")
         while self.processes or self.running:
             # clean up workers that reached TTL
             for process in self.processes:
                 if not process.is_alive():
+                    log.debug(f"cleaning up dead process {process}")
                     self.processes.remove(process)
 
             # start new workers when slots are unfilled
             while self.running and len(self.processes) < self.process_count:
+                log.debug(f"pool is low ({len(self.processes)} < {self.process_count})")
                 process = PoolWorker(
                     self.tx_queue,
                     self.rx_queue,
                     self.maxtasksperchild,
                     self.childconcurrency,
                 )
+                log.debug(f"starting pool worker {process}")
                 process.start()
                 self.processes.append(process)
 
             # pull results into a shared dictionary for later retrieval
             while True:
                 try:
+                    log.debug(f"polling results queue")
                     task_id, value = self.rx_queue.get_nowait()
+                    log.debug(f"task {task_id} returned {value}")
                     self._results[task_id] = value
 
                 except queue.Empty:
                     break
 
             # let someone else do some work for once
-            await asyncio.sleep(0.005)
+            await asyncio.sleep(0.5)
 
     def queue_work(
         self,
