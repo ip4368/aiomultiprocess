@@ -16,6 +16,11 @@ async def two():
     return 2
 
 
+async def sleepypid(t=0.1):
+    await asyncio.sleep(t)
+    return os.getpid()
+
+
 async def mapper(value):
     return value * 2
 
@@ -26,14 +31,11 @@ async def starmapper(*values):
 
 class CoreTest(TestCase):
     def setUp(self):
-        amp.set_context("fork")
+        amp.set_context("spawn")
 
     @async_test
     async def test_process(self):
-        async def sleepy():
-            await asyncio.sleep(0.1)
-
-        p = amp.Process(target=sleepy, name="test_process")
+        p = amp.Process(target=sleepypid, name="test_process")
         p.start()
 
         self.assertEqual(p.name, "test_process")
@@ -45,10 +47,7 @@ class CoreTest(TestCase):
 
     @async_test
     async def test_process_timeout(self):
-        async def sleepy():
-            await asyncio.sleep(1)
-
-        p = amp.Process(target=sleepy)
+        p = amp.Process(target=sleepypid, args=(1,))
         p.start()
 
         with self.assertRaises(asyncio.TimeoutError):
@@ -56,10 +55,6 @@ class CoreTest(TestCase):
 
     @async_test
     async def test_worker(self):
-        async def sleepypid():
-            await asyncio.sleep(0.1)
-            return os.getpid()
-
         p = amp.Worker(target=sleepypid)
         p.start()
         await p.join()
@@ -69,10 +64,6 @@ class CoreTest(TestCase):
 
     @async_test
     async def test_worker_join(self):
-        async def sleepypid():
-            await asyncio.sleep(0.1)
-            return os.getpid()
-
         # test results from join
         p = amp.Worker(target=sleepypid)
         p.start()
