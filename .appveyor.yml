@@ -1,6 +1,8 @@
 init:
   - ECHO %PYTHON%
 
+version: '{build}'
+
 environment:
   matrix:
     - PYTHON: C:/Python37
